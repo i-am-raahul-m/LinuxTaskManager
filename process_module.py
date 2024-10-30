@@ -52,29 +52,79 @@ class Process_Analytics_Module:
 
 
 class Process_Interactive_Module:
-    """ Creates, assigns work to and kills processes
-    run_process() -> runs created process
-    wait_for_process() -> waits until the complete execution of running process before flow of control moves further
-    kill_process() -> kills the process it is called on immediately """
+    """Creates, assigns work to, and kills processes.
+    
+    run_process() -> Runs the created process.
+    wait_for_process() -> Waits until the complete execution of the running process before control moves further.
+    kill_process() -> Kills the process immediately.
+    """
     
     worker_script_path = os.path.join(os.path.dirname(__file__), 'worker.py')
     worker_executable_path = ''
     extension = '.py'
 
-    def __init__(self, task_string, ext, preemtable = False):
+    SCHEDULED_BACKUP_SCRIPT = r"""
+#!/bin/bash
+
+# Configuration
+SOURCE_DIR="/path/to/source"       # Directory to back up
+BACKUP_DIR="/path/to/backup"       # Directory to save backups
+INTERVAL="daily"                   # Interval options: "daily", "weekly", or "monthly"
+TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+BACKUP_FILE="$BACKUP_DIR/backup_$TIMESTAMP.tar.gz"
+
+# Create the backup directory if it doesn't exist
+mkdir -p "$BACKUP_DIR"
+
+# Function to create a backup
+create_backup() {
+    echo "Starting backup of $SOURCE_DIR to $BACKUP_FILE..."
+    tar -czf "$BACKUP_FILE" -C "$SOURCE_DIR" .
+    echo "Backup complete: $BACKUP_FILE"
+}
+
+# Schedule the backup
+case "$INTERVAL" in
+    daily)
+        echo "Scheduling daily backups..."
+        echo "0 2 * * * $(whoami) $0" | crontab -   # Every day at 2:00 AM
+        ;;
+    weekly)
+        echo "Scheduling weekly backups..."
+        echo "0 2 * * 0 $(whoami) $0" | crontab -   # Every Sunday at 2:00 AM
+        ;;
+    monthly)
+        echo "Scheduling monthly backups..."
+        echo "0 2 1 * * $(whoami) $0" | crontab -   # First day of each month at 2:00 AM
+        ;;
+    *)
+        echo "Invalid interval specified. Choose 'daily', 'weekly', or 'monthly'."
+        exit 1
+        ;;
+esac
+
+create_backup
+"""
+
+    def __init__(self, task_string, ext, preemtable=False):
         try:
             self.preemptable = preemtable
             self.task_string = task_string
+            
             if ext == '.c':
                 self.worker_script_path = os.path.join(os.path.dirname(__file__), 'worker.c')
                 self.worker_executable_path = os.path.join(os.path.dirname(__file__), 'worker')
                 self.__create_worker()  # Create the worker script
                 self.__compile_worker()  # Compile the C work script
                 self.extension = '.c'
+            
+            elif ext == '.sh':
+                self.worker_script_path = os.path.join(os.path.dirname(__file__), 'worker.sh')
+                self.__create_worker()  # Create the worker Bash script
+                self.extension = '.sh'
 
         except Exception as e:
             print(f"An error occurred: {e}")
-    
 
     ### PRIVATE METHODS
     def __create_worker(self):
@@ -83,30 +133,30 @@ class Process_Interactive_Module:
             file.write(self.task_string)
         
         # Give permission to execute the created script file
-        os.chmod(self.worker_script_path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IWGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        os.chmod(self.worker_script_path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR |
+                 stat.S_IRGRP | stat.S_IWGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
 
     def __compile_worker(self):
         # Compile the C code into an executable
         compile_command = ['gcc', self.worker_script_path, '-o', self.worker_executable_path]
-        subprocess.run(compile_command, check=True)  # This will raise an error if the compilation fails
+        subprocess.run(compile_command, check=True)  # Raises an error if the compilation fails
 
-    # Function to create a new process
     def __create_process(self):
         if self.extension == '.py':
             # Create task to give process
             self.__create_worker()
+            command = ['python3', self.worker_script_path]  # Run Python script
 
-            # Define the command to run as a separate process
-            command = [self.worker_script_path]
+        elif self.extension == '.c':
+            command = [self.worker_executable_path]  # Run compiled C executable
 
-        if self.extension == '.c':
-            # Define the command to run the compiled work executable
-            command = [self.worker_executable_path]
+        elif self.extension == '.sh':
+            self.__create_worker()
+            command = ['bash', self.worker_script_path]  # Run Bash script
         
         # Create a subprocess
         process = subprocess.Popen(command)
         return process
-
 
     ### PUBLIC METHODS
     def run_process(self):
@@ -124,15 +174,11 @@ class Process_Interactive_Module:
     def wait_for_process(self):
         self.process.wait()
 
-    # User-defined method to kill the process prematurely
     def kill_process(self):
         try:
             self.process.terminate()  # Terminate the process
             self.process.wait()  # Wait for it to exit
             print(f"PROCESS PID: {self.process.pid} KILLED.")
-
-        except psutil.NoSuchProcess:
-            print("Process does not exist.")
 
         except Exception as e:
             print(f"Error killing the process: {e}")
@@ -141,14 +187,98 @@ class Process_Interactive_Module:
         if os.path.exists(self.worker_script_path):
             os.remove(self.worker_script_path)
 
-        if self.extension == '.c':
-            # Cleanup: Remove the work executable
-            if os.path.exists(self.worker_executable_path):
-                os.remove(self.worker_executable_path)
+        if self.extension == '.c' and os.path.exists(self.worker_executable_path):
+            # Cleanup: Remove the C executable
+            os.remove(self.worker_executable_path)
+
+class Backups_Module:
+    def __init__(self, source_dir, backup_dir, interval):
+        self.src = source_dir
+        self.dst = backup_dir
+        self.interval = interval
+
+    ### PRIVATE METHODS
+    def __create_backup_script(self):
+        """Create a backup Bash script that will copy files from source to destination."""
+        # Define the backup script content
+        script_content = f"""#!/bin/bash
+
+    # Configuration
+    SOURCE_DIR="{self.src}"       # Directory to back up
+    BACKUP_DIR="{self.dst}"       # Directory to save backups
+    INTERVAL="{self.interval}"                   # Interval options: "daily", "weekly", or "monthly"
+    TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+    BACKUP_FILE="$BACKUP_DIR/backup_$TIMESTAMP.tar.gz"
+
+    # Create the backup directory if it doesn't exist
+    mkdir -p "$BACKUP_DIR"
+
+    # Function to create a backup
+    create_backup() {{
+        echo "Starting backup of $SOURCE_DIR to $BACKUP_FILE..."
+        tar -czf "$BACKUP_FILE" -C "$SOURCE_DIR" .
+        echo "Backup complete: $BACKUP_FILE"
+    }}
+
+    # Schedule the backup
+    case "$INTERVAL" in
+        daily)
+            echo "Scheduling daily backups..."
+            echo "0 2 * * * $(whoami) $0" | crontab -   # Every day at 2:00 AM
+            ;;
+        weekly)
+            echo "Scheduling weekly backups..."
+            echo "0 2 * * 0 $(whoami) $0" | crontab -   # Every Sunday at 2:00 AM
+            ;;
+        monthly)
+            echo "Scheduling monthly backups..."
+            echo "0 2 1 * * $(whoami) $0" | crontab -   # First day of each month at 2:00 AM
+            ;;
+        *)
+            echo "Invalid interval specified. Choose 'daily', 'weekly', or 'monthly'."
+            exit 1
+            ;;
+    esac
+
+    # Run the backup immediately
+    create_backup
+    """
+
+        # Write the script to a temporary file
+        script_path = "/tmp/backup_script.sh"  # Temporary location
+        with open(script_path, 'w') as script_file:
+            script_file.write(script_content)
+
+        # Make the script executable
+        os.chmod(script_path, 0o755)
+        return script_path
+
+    ### PUBLIC METHODS
+    def run_backup(self):
+        """Run the backup Bash script using psutil."""
+        script_path = self.__create_backup_script()
+        
+        try:
+            # Run the backup script as a subprocess
+            process = subprocess.Popen(['bash', script_path])
+            print(f"Running backup script with PID: {process.pid}")
+
+            # Wait for the process to complete
+            process.wait()
+            print(f"Backup script completed with PID: {process.pid}")
+        
+        except Exception as e:
+            print(f"Error running the backup script: {e}")
+
+        finally:
+            # Clean up: remove the script after execution
+            if os.path.exists(script_path):
+                os.remove(script_path)
 
 
 if __name__ == '__main__':
-    # Process_Analytics_Module()
+    Process_Analytics_Module()
+
     task_string = """#!/usr/bin/env python3
 import time
 
@@ -190,5 +320,12 @@ int main() {
     return 0;
 }
 """
-    p = Process_Interactive_Module(task_string2, '.py', False)
-    p.run_process()
+    task_string4 = """
+    #!/bin/bash
+
+# Loop from 1 to 100
+for ((i=1; i<=100; i++))
+do
+  echo $i
+done
+"""
